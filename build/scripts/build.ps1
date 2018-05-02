@@ -28,10 +28,10 @@ param (
     [switch]$pack = $false,
     [switch]$packAll = $false,
     [switch]$binaryLog = $false,
-    [switch]$noAnalyzers = $false,
-    [switch]$skipBuildExtras = $false,
     [switch]$deployExtensions = $false,
     [string]$signType = "",
+    [switch]$skipBuildExtras = $false,
+    [switch]$skipAnalyzers = $false,
 
     # Test options 
     [switch]$test32 = $false,
@@ -45,8 +45,6 @@ param (
     # Special test options
     [switch]$testDeterminism = $false,
     [switch]$testBuildCorrectness = $false,
-    [switch]$testPerfCorrectness = $false,
-    [switch]$testPerfRun = $false,
 
     [parameter(ValueFromRemainingArguments=$true)] $badArgs)
 
@@ -65,6 +63,8 @@ function Print-Usage() {
     Write-Host "  -pack                     Create our NuGet packages"
     Write-Host "  -deployExtensions         Deploy built vsixes"
     Write-Host "  -binaryLog                Create binary log for every MSBuild invocation"
+    Write-Host "  -skipAnalyzers            Do not run analyzers during build operations"
+    Write-Host "  -skipBuildExtras          Do not build insertion items"
     Write-Host "" 
     Write-Host "Test options" 
     Write-Host "  -test32                   Run unit tests in the 32-bit runner"
@@ -78,8 +78,6 @@ function Print-Usage() {
     Write-Host "Special Test options" 
     Write-Host "  -testBuildCorrectness     Run build correctness tests"
     Write-Host "  -testDeterminism          Run determinism tests"
-    Write-Host "  -testPerfCorrectness      Run perf correctness tests"
-    Write-Host "  -testPerfCorrectness      Run perf tests"
 }
 
 # Process the command line arguments and establish defaults for the values which are not 
@@ -108,7 +106,12 @@ function Process-Arguments() {
         exit 1
     }
 
-    $script:isAnyTestSpecial = $testBuildCorrectness -or $testDeterminism -or $testPerfCorrectness -or $testPerfRun
+    if (($cibuild -and $anyVsi)) {
+        # Avoid spending time in analyzers when requested, and also in the slowest integration test builds
+        $script:skipAnalyzers = $true
+    }
+
+    $script:isAnyTestSpecial = $testBuildCorrectness -or $testDeterminism 
     if ($isAnyTestSpecial -and ($anyUnit -or $anyVsi)) {
         Write-Host "Cannot combine special testing with any other action"
         exit 1
@@ -136,8 +139,7 @@ function Run-MSBuild([string]$projectFilePath, [string]$buildArgs = "", [string]
         $args += " /m"
     }
 
-    if ($noAnalyzers -or ($cibuild -and $testVsi)) {
-        # Avoid spending time in analyzers when requested, and also in the slowest integration test builds
+    if ($skipAnalyzers) {
         $args += " /p:UseRoslynAnalyzers=false"
     }
 
@@ -440,50 +442,8 @@ function Test-Special() {
         $bootstrapDir = Make-BootstrapBuild
         Exec-Block { & ".\build\scripts\test-determinism.ps1" -bootstrapDir $bootstrapDir } | Out-Host
     } 
-    elseif ($testPerfCorrectness) {
-        Test-PerfCorrectness
-    }
-    elseif ($testPerfRun) {
-        Test-PerfRun
-    }
     else {
         throw "Not a special test"
-    }
-}
-
-function Test-PerfCorrectness() {
-    Run-MSBuild "Roslyn.sln" "/p:DeployExtension=$deployExtensions" -logFileName "RoslynPerfCorrectness"
-    Exec-Block { & ".\Binaries\$buildConfiguration\Exes\Perf.Runner\Roslyn.Test.Performance.Runner.exe" --ci-test } | Out-Host
-}
-
-function Test-PerfRun() { 
-    Run-MSBuild "Roslyn.sln" "/p:DeployExtension=$deployExtensions" -logFileName "RoslynPerfRun"
-
-    # Check if we have credentials to upload to benchview
-    $extraArgs = @()
-    if ((Test-Path env:\GIT_BRANCH) -and (Test-Path env:\BV_UPLOAD_SAS_TOKEN)) {
-        $extraArgs += "--report-benchview"
-        $extraArgs += "--branch=$env:GIT_BRANCH"
-
-        # Check if we are in a PR or this is a rolling submission
-        if (Test-Path env:\ghprbPullTitle) {
-            $submissionName = $env:ghprbPullTitle.Replace(" ", "_")
-            $extraArgs += "--benchview-submission-name=""$submissionName"""
-            $extraArgs += "--benchview-submission-type=private"
-        } 
-        else {
-            $extraArgs += "--benchview-submission-type=rolling"
-        }
-
-        Create-Directory ".\Binaries\$buildConfiguration\tools\"
-        # Get the benchview tools - Place alongside Roslyn.Test.Performance.Runner.exe
-        Exec-Block { & ".\build\scripts\install_benchview_tools.cmd" ".\Binaries\$buildConfiguration\tools\" } | Out-Host
-    }
-
-    Stop-BuildProcesses
-    & ".\Binaries\$buildConfiguration\Exes\Perf.Runner\Roslyn.Test.Performance.Runner.exe"  $extraArgs --search-directory=".\\Binaries\\$buildConfiguration\\Dlls\\" --no-trace-upload
-    if (-not $?) { 
-        throw "Perf run failed"
     }
 }
 
